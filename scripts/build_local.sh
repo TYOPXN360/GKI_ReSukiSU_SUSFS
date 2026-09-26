@@ -19,29 +19,58 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=local-env.sh
 source "$SCRIPT_DIR/local-env.sh"
 
-ROOT="\$LOCAL_WORK"
-PROJ="\$GIT_ROOT"
-SUSFS4KSU="\$ROOT/susfs4ksu"
-ACTION_BUILD="\$ROOT/Action-Build"
-ANYKERNEL3="\$ROOT/AnyKernel3"
-PERF_DIR="\${PERF_PATCH_DIR:-\$GIT_ROOT/../GKID-Kernels/kernel-patches/common}"
-ZRAM_DIR="\$GIT_ROOT/zram"
-BBRV3_PATCH="\${BBRV3_PATCH:-\$GIT_ROOT/patches/bbrv3-6.12.patch}"
-
 ANDROID_VERSION=android16; KERNEL_VERSION=6.12; OS_PATCH_LEVEL=dev
 
+ROOT="$LOCAL_WORK"
+PROJ="$GIT_ROOT"
+SUSFS4KSU=""   # 在下方按变种确定，避免不同变种互相污染
+ACTION_BUILD="$ROOT/Action-Build"
+ANYKERNEL3="$ROOT/AnyKernel3"
+PERF_DIR="${PERF_PATCH_DIR:-$GIT_ROOT/../GKID-Kernels/kernel-patches/common}"
+ZRAM_DIR="$GIT_ROOT/zram"
+BBRV3_PATCH="${BBRV3_PATCH:-$GIT_ROOT/patches/bbrv3-6.12.patch}"
+
+# SuSFS 变种（两者补丁文件名一致，均为 50_add_susfs_in_gki-android16-6.12.patch）
+#   susfs4oki  (默认) cctv18/susfs4oki    分支 oki-android16-6.12-dev
+#   susfs4ksu          simonpunk/susfs4ksu 分支 gki-android16-6.12
+SUSFS_VARIANT="${SUSFS_VARIANT:-susfs4oki}"
+case "$SUSFS_VARIANT" in
+  susfs4oki)
+    SUSFS_REPO="https://github.com/cctv18/susfs4oki"
+    SUSFS_BRANCH="oki-android16-$KERNEL_VERSION-dev"
+    SUSFS4KSU="$ROOT/susfs-src/susfs4oki"
+    ;;
+  susfs4ksu)
+    SUSFS_REPO="https://gitlab.com/simonpunk/susfs4ksu.git"
+    SUSFS_BRANCH="gki-$ANDROID_VERSION-$KERNEL_VERSION"
+    SUSFS4KSU="$ROOT/susfs-src/susfs4ksu"
+    ;;
+  *) die "未知 SUSFS_VARIANT=$SUSFS_VARIANT（可选 susfs4oki/susfs4ksu）" ;;
+esac
+
+
 # ---- 特性开关（均可用环境变量覆盖）----
-FEAT_NTSYNC="\${FEAT_NTSYNC:-true}"           # NTSync 解禁
-FEAT_BBG="\${FEAT_BBG:-true}"                 # BBG 防格机
-FEAT_DROIDSPACES="\${FEAT_DROIDSPACES:-true}" # Droidspaces 容器
-FEAT_BBRV3="\${FEAT_BBRV3:-true}"             # BBRv3
-FEAT_LZ4_NEON="\${FEAT_LZ4_NEON:-true}"       # LZ4 1.10.0 + ARM64 NEON
-FEAT_TUNING="\${FEAT_TUNING:-true}"           # HZ=300 + ZRAM
-FEAT_NETFILTER="\${FEAT_NETFILTER:-true}"     # IP_SET 完整集 + IPv6 NAT + WESTWOOD/TTL
-USE_PERF="\${USE_PERF:-true}"                 # GKID 性能补丁包
+FEAT_NTSYNC="${FEAT_NTSYNC:-true}"           # NTSync 解禁
+FEAT_BBG="${FEAT_BBG:-true}"                 # BBG 防格机
+FEAT_DROIDSPACES="${FEAT_DROIDSPACES:-true}" # Droidspaces 容器
+FEAT_BBRV3="${FEAT_BBRV3:-true}"             # BBRv3
+FEAT_LZ4_NEON="${FEAT_LZ4_NEON:-true}"       # LZ4 1.10.0 + ARM64 NEON
+FEAT_TUNING="${FEAT_TUNING:-true}"           # HZ=300 + ZRAM
+FEAT_NETFILTER="${FEAT_NETFILTER:-true}"     # IP_SET 完整集 + IPv6 NAT + WESTWOOD/TTL
+USE_PERF="${USE_PERF:-true}"                 # GKID 性能补丁包
 
 log "0/8 校验源码"
-[ -d "$COMMON" ] || die "common 不存在，请先运行 upgrade_kernel.sh"
+[ -d "$COMMON" ] || die "内核源码不存在: $COMMON
+请先运行：scripts/recover_sync.sh
+（若源码已在但状态异常，先跑 scripts/reset_tree.sh）"
+
+# 硬护栏：源码树必须处于纯净状态。
+# 否则补丁会重复套用（patch 报 "Reversed or previously applied"），
+# 造成部分 hunk 静默失败、编译错误难以定位。
+_dirty=$(git -C "$COMMON" status --short 2>/dev/null | wc -l)
+[ "$_dirty" -eq 0 ] || die "源码树有 $_dirty 处改动，必须先重置：
+    LOCAL_WORK=$(cd "$LOCAL_WORK" && pwd) scripts/reset_tree.sh
+（注意 reset_tree.sh 必须与本脚本使用相同的 LOCAL_WORK）"
 SUBLEVEL=$(awk '/^SUBLEVEL = / {print $3; exit}' "$COMMON/Makefile")
 COMMIT=$(git -C "$COMMON" rev-parse --short=13 HEAD)
 CURRENT_SUB="$SUBLEVEL"
@@ -50,7 +79,27 @@ ok "源码 6.12.$SUBLEVEL ($COMMIT)"
 log "1/8 克隆依赖"
 cd "$ROOT"
 [ -d "$ACTION_BUILD/.git" ] || retry 4 10 git clone --depth=1 https://github.com/Numbersf/Action-Build.git
-[ -d "$SUSFS4KSU/.git" ] || retry 6 15 git clone --depth=1 https://gitlab.com/simonpunk/susfs4ksu.git -b "gki-$ANDROID_VERSION-$KERNEL_VERSION"
+# 校验已存在的克隆确实是本变种（切换变种时目录名不同，这里再校验一次 remote）
+if [ -d "$SUSFS4KSU/kernel_patches" ]; then
+  have=$(git -C "$SUSFS4KSU" remote get-url origin 2>/dev/null || echo "")
+  case "$have" in
+    *cctv18/susfs4oki*|*simonpunk/susfs4ksu*) : ;;
+    *) warn "现有克隆来源异常（$have），重新拉取"; rm -rf "$SUSFS4KSU" ;;
+  esac
+fi
+if [ ! -d "$SUSFS4KSU/kernel_patches" ]; then
+  rm -rf "$SUSFS4KSU"
+  log "获取 SuSFS: $SUSFS_VARIANT ($SUSFS_BRANCH)"
+  retry 6 15 git clone --depth=1 "$SUSFS_REPO" -b "$SUSFS_BRANCH" "$SUSFS4KSU"
+fi
+SUSFS_HEAD=$(git -C "$SUSFS4KSU" log --oneline -1)
+ok "SuSFS 变种: $SUSFS_VARIANT  $SUSFS_HEAD"
+# 兜底校验：确保内核里用的确实是本变种的 susfs.c
+if ! cmp -s "$SUSFS4KSU/kernel_patches/fs/susfs.c" "$COMMON/fs/susfs.c"; then
+  warn "susfs.c 与 $SUSFS_VARIANT 不一致，重新复制"
+  cp "$SUSFS4KSU/kernel_patches/fs/"* "$COMMON/fs/"
+  cp "$SUSFS4KSU/kernel_patches/include/linux/"* "$COMMON/include/linux/"
+fi
 if [ "$FEAT_DROIDSPACES" = "true" ]; then
   [ -d "$ROOT/Droidspaces-OSS" ] || retry 4 10 git clone --depth 1 https://github.com/ravindu644/Droidspaces-OSS.git "$ROOT/Droidspaces-OSS"
 fi
@@ -62,14 +111,40 @@ cd "$COMMON"
 bash "$PROJ/security_patch/apply_cve_2026_43499.sh" "$KERNEL_VERSION" "$CURRENT_SUB" "$PROJ/security_patch" \
   || warn "CVE 修复链脚本返回非零（可能已应用）"
 
-log "3/8 添加 ReSukiSU"
+log "3/8 添加 ReSukiSU（始终拉取最新版本）"
 cd "$KERNEL_ROOT"
-# setup.sh 内部会执行 git clone + git pull，网络不稳时必然挂起。
-# 改为：用 tarball 预置的 KernelSU（内容与 GitHub main 分支一致），
-#       手动复现 setup.sh 的集成步骤（软链 + Makefile + Kconfig），全程不依赖网络。
-if [ ! -d "$KERNEL_ROOT/KernelSU/kernel" ]; then
-  die "KernelSU 未预置：请先用 codeload tarball 下载解包并 git init 初始化"
+# ReSukiSU 的 setup.sh 内部会 git clone + git pull，代理下传大 pack 必被截断且会挂起，
+# 因此改为每次构建都从 codeload 拉 main 分支最新 tarball（实测 1 秒内完成），
+# 再手动复现 setup.sh 的集成步骤（软链 + Makefile + Kconfig）。
+KSU_REPO="${KSU_REPO:-https://github.com/ReSukiSU/ReSukiSU}"
+KSU_BRANCH="${KSU_BRANCH:-main}"
+KSU_TGZ="$LOCAL_CACHE/ReSukiSU-$KSU_BRANCH.tgz"
+
+rm -rf "$KERNEL_ROOT/KernelSU"
+# 注意：这里不能用 fetch_file（它优先用缓存），因为要求每次都取最新版本。
+# 先尝试下载，失败才回退缓存。
+KSU_URL="https://codeload.github.com/ReSukiSU/ReSukiSU/tar.gz/refs/heads/$KSU_BRANCH"
+if retry 3 5 curl -sSL -o "$KSU_TGZ.new" "$KSU_URL" \
+   || retry 3 5 curl -sSL -o "$KSU_TGZ.new" \
+        "https://ghfast.top/codeload.github.com/ReSukiSU/ReSukiSU/tar.gz/refs/heads/$KSU_BRANCH"; then
+  [ -s "$KSU_TGZ.new" ] && mv -f "$KSU_TGZ.new" "$KSU_TGZ"
+  ok "已获取 ReSukiSU 最新 $KSU_BRANCH"
+else
+  rm -f "$KSU_TGZ.new"
+  warn "ReSukiSU 下载失败，回退到本地缓存"
+  [ -s "$KSU_TGZ" ] || die "ReSukiSU 无缓存可用，请检查网络或设置 KSU_REPO/KSU_BRANCH"
 fi
+
+# --strip-components=1：兼容 codeload 的 "ReSukiSU-<branch>/" 与本地缓存的 "KernelSU/" 两种顶层目录名
+mkdir -p "$KERNEL_ROOT/KernelSU"
+tar xzf "$KSU_TGZ" -C "$KERNEL_ROOT/KernelSU" --strip-components=1
+[ -d "$KERNEL_ROOT/KernelSU/kernel" ] || die "ReSukiSU 解包异常，缺少 kernel/ 目录"
+# 建本地 git 仓库：ReSukiSU 的版本串与版本检查依赖 git log -1
+( cd "$KERNEL_ROOT/KernelSU" \
+  && git init -q -b main . \
+  && git config user.email "${GIT_USER_EMAIL:-builder@local}" \
+  && git config user.name  "${GIT_USER_NAME:-local builder}" \
+  && git add -A && git commit -q -m "ReSukiSU $KSU_BRANCH ($(date -u +%Y-%m-%d))" ) || warn "本地 git 初始化失败"
 rm -f "$KERNEL_ROOT/common/drivers/kernelsu"
 ln -sf ../../KernelSU/kernel "$KERNEL_ROOT/common/drivers/kernelsu"
 ok "KSU 软链: common/drivers/kernelsu -> ../../KernelSU/kernel"
@@ -81,7 +156,7 @@ grep -q 'source "drivers/kernelsu/Kconfig"' "$DRV_KCFG" || sed -i '/^endmenu/i s
 ok "drivers/Makefile 与 drivers/Kconfig 已注入"
 ok "KSU 版本: $(git -C KernelSU log --oneline -1 2>/dev/null || echo '本地导入')"
 
-log "4/8 应用 SuSFS 补丁"
+log "4/8 应用 SuSFS 补丁（$SUSFS_VARIANT）"
 cd "$KERNEL_ROOT"
 cp "$SUSFS4KSU/kernel_patches/50_add_susfs_in_gki-$ANDROID_VERSION-$KERNEL_VERSION.patch" ./common/
 cp "$SUSFS4KSU/kernel_patches/fs/"* ./common/fs/
@@ -113,7 +188,7 @@ if [ "$FEAT_LZ4_NEON" = "true" ] && [ -d "$ZRAM_DIR" ]; then
   # 2) 把 NEON 条件编译接入各调用点
   bash "$ZRAM_DIR/apply_lz4_neon.sh" && ok "NEON 条件编译已接入" || warn "NEON 脚本返回非零"
   # 3) f2fs iostat（ZRAM 流程需要）
-  if [ -f fs/f2fs/Makefile ] && ! grep -qF 'f2fs-\$(CONFIG_F2FS_IOSTAT) += iostat.o' fs/f2fs/Makefile; then
+  if [ -f fs/f2fs/Makefile ] && ! grep -qF 'f2fs-$(CONFIG_F2FS_IOSTAT) += iostat.o' fs/f2fs/Makefile; then
     echo 'f2fs-$(CONFIG_F2FS_IOSTAT) += iostat.o' >> fs/f2fs/Makefile
   fi
   cd "$COMMON"
@@ -270,11 +345,16 @@ cd "$COMMON"
 GHASH=$(git rev-parse --verify HEAD | cut -c1-13)
 BID="ab$((RANDOM % 90000000 + 10000000))"
 SUFFIX="-android16-5-g${GHASH}-${BID}"
+# 注意转义：perl 正则里的 \$ 必须保持为 \$，否则 shell 会先展开 ${KERNELVERSION}，
+# 导致 setlocalversion 被改坏、内核 release 丢失 "6.12.x" 前缀而变成以 "-" 开头，
+# 进而让 depmod 把版本串当成选项（unrecognized option: d）。
 perl -i -0777 -pe "s/(.*)echo \"\\\$\{KERNELVERSION\}\\\$\{file_localversion\}\\\$\{config_localversion\}\\\$\{LOCALVERSION\}\\\$\{scm_version\}\"/\$1echo \"\\\${KERNELVERSION}${SUFFIX}\\\$\{config_localversion\}\"/s" ./scripts/setlocalversion
+# 校验：改完 setlocalversion 仍应保留 KERNELVERSION 的拼接形式
+grep -q 'KERNELVERSION' ./scripts/setlocalversion || die "setlocalversion 被改坏，请检查"
 export KBUILD_BUILD_TIMESTAMP="$(TZ='UTC' date +'%a %b %d %T %Z %Y')"
 export KBUILD_BUILD_VERSION=1
 if grep -q 'UTS_VERSION=' ./scripts/mkcompile_h; then
-  perl -pi -e "s{UTS_VERSION=\"\\\$\\\(.*?\\\)(\s*)\"}{UTS_VERSION=\"\\\$1 SMP PREEMPT $KBUILD_BUILD_TIMESTAMP\"}" ./scripts/mkcompile_h
+  perl -pi -e "s{UTS_VERSION=\"\\$\\\(.*?\\\)(\s*)\"}{UTS_VERSION=\"\\$1 SMP PREEMPT $KBUILD_BUILD_TIMESTAMP\"}" ./scripts/mkcompile_h
 fi
 
 # --- 生成 fragment ---

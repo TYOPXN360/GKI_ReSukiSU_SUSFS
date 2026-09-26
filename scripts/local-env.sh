@@ -25,13 +25,22 @@ OUT="$KERNEL_ROOT/out"
 DEFCONFIG="$COMMON/arch/arm64/configs/gki_defconfig"
 FRAG="$COMMON/arch/arm64/configs/ksu.fragment"
 
-# 可写 HOME（原仓库若在只读文件系统上，ccache/pahole 会装不进去）
-export HOME="${LOCAL_HOME:-$LOCAL_WORK/home}"
+# 可写 HOME：ccache / pahole / git 凭据都装在这里。
+# 优先级：LOCAL_HOME > 已有的 HOME > $LOCAL_WORK/home
+# （原仓库若在只读文件系统上，已有的 HOME 不可写时才需要指到 LOCAL_HOME）
+if [ -z "${LOCAL_HOME:-}" ] && { [ -z "${HOME:-}" ] || [ ! -w "${HOME:-/nonexistent}" ]; }; then
+  LOCAL_HOME="$LOCAL_WORK/home"
+fi
+export HOME="${LOCAL_HOME:-${HOME:-$LOCAL_WORK/home}}"
 mkdir -p "$HOME"
+[ -w "$HOME" ] || die "HOME 不可写: $HOME（请设 LOCAL_HOME 指向可写目录）"
 
-# 免 root 工具（cmake/zstd/cpio/pkgconf 等，见 README 本地构建章节）
-[ -d "$LOCAL_TOOLS/root/usr/bin" ] && \
-  export PATH="$LOCAL_TOOLS/cmake/bin:$LOCAL_TOOLS/root/usr/bin:$PATH"
+# 免 root 工具（cmake/zstd/cpio/pkgconf 等，见 docs/local-build.md）
+# cmake 目录名可能是 cmake/ 或 cmake-<版本>/
+for c in "$LOCAL_TOOLS"/cmake "$LOCAL_TOOLS"/cmake-*; do
+  [ -x "$c/bin/cmake" ] && export PATH="$c/bin:$PATH" && break
+done
+[ -d "$LOCAL_TOOLS/root/usr/bin" ] && export PATH="$LOCAL_TOOLS/root/usr/bin:$PATH"
 [ -d "$LOCAL_TOOLS/root/usr/lib/x86_64-linux-gnu" ] && \
   export LD_LIBRARY_PATH="$LOCAL_TOOLS/root/usr/lib/x86_64-linux-gnu${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 [ -d "$HOME/.local/bin" ] && export PATH="$HOME/.local/bin:$PATH"
