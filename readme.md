@@ -110,6 +110,23 @@
 
 ---
 
+## 🧰 本地构建（无需 GitHub Actions）
+
+仓库 [`scripts/`](scripts/) 下提供了一套完整的本地构建脚本，用于调试、定制或离线出包：
+
+```bash
+scripts/recover_sync.sh    # 同步 AOSP 内核源码（首次）
+scripts/build_local.sh     # 构建（默认全特性 + Bazel + lto=none）
+```
+
+支持通过环境变量开关各特性（`FEAT_BBRV3` / `FEAT_NTSYNC` / `FEAT_BBG` / `FEAT_DROIDSPACES` / `FEAT_LZ4_NEON` / `FEAT_TUNING` / `FEAT_NETFILTER` / `USE_PERF`）。
+
+> ⚠️ **6.12 请勿开启 LTO**：实测 thin 与 full LTO 均会导致内核无法启动（与编译器无关），详见 [本地构建文档](docs/local-build.md)。
+
+详细说明与踩坑记录见 [`docs/local-build.md`](docs/local-build.md)。
+
+---
+
 <div align="center">
 
 **更多内容持续更新中...**

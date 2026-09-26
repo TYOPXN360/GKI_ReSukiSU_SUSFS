@@ -1076,8 +1076,16 @@ jobs:
           wget -q "https://raw.githubusercontent.com/Goldzxcbug/Droidspaces_Kernel_patch/refs/heads/main/NTsync/ntsync_base.patch"
           wget -q "https://raw.githubusercontent.com/Goldzxcbug/Droidspaces_Kernel_patch/refs/heads/main/NTsync/${NTSYNC_PATCH}.patch"
 
-          patch -p1 < "ntsync_base.patch"
-          patch -p1 < "${NTSYNC_PATCH}.patch"
+          # 6.12+ 的上游源码已自带 NTSync（drivers/misc/ntsync.c 与
+          # include/uapi/linux/ntsync.h 均已存在），此时再打 ntsync_base.patch
+          # 会因"重复创建文件"而整块失败，配合 set -e 直接中断构建。
+          # 因此仅在源码中确实没有 NTSync 时才应用基础补丁。
+          if [ -e drivers/misc/ntsync.c ] || [ -e include/uapi/linux/ntsync.h ]; then
+            echo "检测到上游已包含 NTSync，跳过 ntsync_base.patch（仅应用 compat 补丁）"
+          else
+            patch -p1 --forward < "ntsync_base.patch"
+          fi
+          patch -p1 --forward < "${NTSYNC_PATCH}.patch"
 
           cd ..
 
